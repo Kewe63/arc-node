@@ -19,7 +19,7 @@
 use core::fmt;
 use std::str::FromStr;
 
-use url::Url;
+use url::{Host, Url};
 
 /// A parsed endpoint URL for RPC synchronization.
 ///
@@ -105,6 +105,21 @@ fn validate_ws_scheme(scheme: &str) -> Result<(), eyre::Report> {
     Ok(())
 }
 
+fn validate_derived_ws_port(http: &Url, has_ws_override: bool) -> Result<(), eyre::Report> {
+    if has_ws_override {
+        return Ok(());
+    }
+
+    if matches!(http.port(), Some(u16::MAX)) {
+        return Err(eyre::eyre!(
+            "Invalid HTTP URL port '{}': derived WebSocket port would overflow.",
+            u16::MAX
+        ));
+    }
+
+    Ok(())
+}
+
 /// Parses a WebSocket override in the format `<scheme>=<value>`.
 ///
 /// The value after `=` can be:
@@ -142,6 +157,7 @@ impl FromStr for SyncEndpointUrl {
             Url::parse(http_part).map_err(|e| eyre::eyre!("Failed to parse HTTP URL: {e}"))?;
 
         validate_http_scheme(http.scheme())?;
+        validate_derived_ws_port(&http, ws_part.is_some())?;
 
         let ws = ws_part
             .map(|part| parse_ws_override(part, &http))
@@ -153,17 +169,23 @@ impl FromStr for SyncEndpointUrl {
 
 impl fmt::Display for SyncEndpointUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let host = self.http.host_str().expect("validated host");
+        let host = host_for_display(&self.http);
         let http_port = self.http.port_or_known_default().expect("validated port");
         let ws_url = self.websocket();
-        let ws_host = ws_url.host_str().expect("validated host");
+        let ws_host = host_for_display(&ws_url);
 
-        write!(
-            f,
-            "{}://{host}:{http_port},{}=",
-            self.http.scheme(),
-            ws_url.scheme()
-        )?;
+        write!(f, "{}://{host}:{http_port}", self.http.scheme())?;
+        let http_path = self.http.path();
+        if http_path != "/" {
+            write!(f, "{http_path}")?;
+        }
+        if let Some(query) = self.http.query() {
+            write!(f, "?{query}")?;
+        }
+        if let Some(fragment) = self.http.fragment() {
+            write!(f, "#{fragment}")?;
+        }
+        write!(f, ",{}=", ws_url.scheme())?;
 
         let ws_path = ws_url.path();
         let has_path = ws_path != "/";
@@ -186,6 +208,13 @@ impl fmt::Display for SyncEndpointUrl {
         }
 
         Ok(())
+    }
+}
+
+fn host_for_display(url: &Url) -> String {
+    match url.host().expect("validated host") {
+        Host::Ipv6(addr) => format!("[{addr}]"),
+        host => host.to_string(),
     }
 }
 
@@ -347,6 +376,41 @@ mod tests {
             .unwrap();
         assert_eq!(url.http().as_str(), "https://example.com/");
         assert_eq!(url.websocket().as_str(), "wss://ws.example.com:1212/");
+    }
+
+    #[test]
+    fn parse_rejects_http_port_that_would_overflow_derived_websocket_port() {
+        let err = "http://localhost:65535"
+            .parse::<SyncEndpointUrl>()
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("derived WebSocket port would overflow"));
+    }
+
+    #[test]
+    fn display_preserves_http_path_and_query() {
+        let endpoint: SyncEndpointUrl =
+            "https://rpc.example.com/api/v1?key=value,wss=ws.example.com/websocket"
+                .parse()
+                .unwrap();
+
+        assert_eq!(
+            endpoint.to_string(),
+            "https://rpc.example.com:443/api/v1?key=value,wss=ws.example.com/websocket"
+        );
+        let reparsed: SyncEndpointUrl = endpoint.to_string().parse().unwrap();
+        assert_eq!(endpoint, reparsed);
+    }
+
+    #[test]
+    fn display_brackets_ipv6_hosts() {
+        let endpoint: SyncEndpointUrl = "http://[::1]:8545,ws=8546".parse().unwrap();
+
+        assert_eq!(endpoint.to_string(), "http://[::1]:8545,ws=8546");
+        let reparsed: SyncEndpointUrl = endpoint.to_string().parse().unwrap();
+        assert_eq!(endpoint, reparsed);
     }
 
     #[test]
