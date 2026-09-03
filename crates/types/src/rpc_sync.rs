@@ -19,7 +19,7 @@
 use core::fmt;
 use std::str::FromStr;
 
-use url::{Host, Url};
+use url::Url;
 
 /// A parsed endpoint URL for RPC synchronization.
 ///
@@ -169,10 +169,10 @@ impl FromStr for SyncEndpointUrl {
 
 impl fmt::Display for SyncEndpointUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let host = host_for_display(&self.http);
+        let host = self.http.host_str().expect("validated host");
         let http_port = self.http.port_or_known_default().expect("validated port");
         let ws_url = self.websocket();
-        let ws_host = host_for_display(&ws_url);
+        let ws_host = ws_url.host_str().expect("validated host");
 
         write!(f, "{}://{host}:{http_port}", self.http.scheme())?;
         let http_path = self.http.path();
@@ -189,10 +189,11 @@ impl fmt::Display for SyncEndpointUrl {
 
         let ws_path = ws_url.path();
         let has_path = ws_path != "/";
+        let has_suffix = has_path || ws_url.query().is_some() || ws_url.fragment().is_some();
 
-        if ws_host != host || has_path {
-            // Include the host when it differs or when a path is present
-            // (a bare port + path like `443/websocket` mis-parses as a hostname)
+        if ws_host != host || has_suffix {
+            // Include the host when it differs or when extra URL components are
+            // present (a bare port plus path/query/fragment mis-parses as a host).
             write!(f, "{ws_host}")?;
             if let Some(ws_port) = ws_url.port() {
                 write!(f, ":{ws_port}")?;
@@ -206,15 +207,14 @@ impl fmt::Display for SyncEndpointUrl {
         if has_path {
             write!(f, "{ws_path}")?;
         }
+        if let Some(query) = ws_url.query() {
+            write!(f, "?{query}")?;
+        }
+        if let Some(fragment) = ws_url.fragment() {
+            write!(f, "#{fragment}")?;
+        }
 
         Ok(())
-    }
-}
-
-fn host_for_display(url: &Url) -> String {
-    match url.host().expect("validated host") {
-        Host::Ipv6(addr) => format!("[{addr}]"),
-        host => host.to_string(),
     }
 }
 
@@ -390,15 +390,15 @@ mod tests {
     }
 
     #[test]
-    fn display_preserves_http_path_and_query() {
+    fn display_preserves_http_and_websocket_path_query_and_fragment() {
         let endpoint: SyncEndpointUrl =
-            "https://rpc.example.com/api/v1?key=value,wss=ws.example.com/websocket"
+            "https://rpc.example.com/api/v1?key=value#http-fragment,wss=ws.example.com/websocket?token=abc#ws-fragment"
                 .parse()
                 .unwrap();
 
         assert_eq!(
             endpoint.to_string(),
-            "https://rpc.example.com:443/api/v1?key=value,wss=ws.example.com/websocket"
+            "https://rpc.example.com:443/api/v1?key=value#http-fragment,wss=ws.example.com/websocket?token=abc#ws-fragment"
         );
         let reparsed: SyncEndpointUrl = endpoint.to_string().parse().unwrap();
         assert_eq!(endpoint, reparsed);
