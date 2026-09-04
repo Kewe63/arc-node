@@ -522,8 +522,14 @@ fn attempt_download(client: &BlockingClient, url: &str, part_path: &Path) -> Res
         let range_start = parse_content_range_start(&response)
             .ok_or_else(|| eyre::eyre!("Server did not provide a valid Content-Range header"))?;
         if range_start != existing_size {
+            std::fs::remove_file(part_path).map_err(|error| {
+                eyre::eyre!(
+                    "Failed to discard mismatched partial download {}: {error}",
+                    part_path.display()
+                )
+            })?;
             return Err(eyre::eyre!(
-                "Server returned Content-Range starting at {range_start}, expected {existing_size}"
+                "Server returned Content-Range starting at {range_start}, expected {existing_size}; discarded partial download"
             ));
         }
     }
@@ -1196,7 +1202,60 @@ mod tests {
             result.is_err(),
             "mismatched Content-Range should not append to the existing .part file"
         );
-        assert_eq!(std::fs::read(part_path)?, b"prefix-");
+        assert!(
+            !part_path.exists(),
+            "a mismatched partial response should discard the stale .part file"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumable_download_recovers_from_mismatched_content_range_start() -> Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let url = format!("{}/snap/consensus.tar.lz4", server.uri());
+        let dir = tempfile::tempdir()?;
+        let (part_path, marker_path) = seed_partial_download(dir.path(), &url, b"prefix-")?;
+
+        Mock::given(method("GET"))
+            .and(path("/snap/consensus.tar.lz4"))
+            .respond_with(|request: &wiremock::Request| {
+                if request.headers.contains_key("range") {
+                    ResponseTemplate::new(206)
+                        .set_body_bytes(b"pref".to_vec())
+                        .append_header("Content-Range", "bytes 0-3/11")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(b"prefix-rest".to_vec())
+                        .append_header("Content-Length", "11")
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let (downloaded_path, total) =
+            run_resumable_download(url, dir.path().to_path_buf()).await?;
+
+        let requests = server
+            .received_requests()
+            .await
+            .ok_or_else(|| eyre::eyre!("Request recording is disabled"))?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("range")
+                .expect("first request should resume")
+                .to_str()?,
+            "bytes=7-"
+        );
+        assert!(!requests[1].headers.contains_key("range"));
+        assert_eq!(std::fs::read(downloaded_path)?, b"prefix-rest");
+        assert_eq!(total, 11);
+        assert!(!part_path.exists());
+        assert!(!marker_path.exists());
         Ok(())
     }
 
